@@ -18,7 +18,7 @@
 # Model Arguments
 model:
   _component_: torchtune.models.llama2.qlora_llama2_7b
-  lora_attn_modules: ['q_proj', 'v_proj', 'k_proj', 'output_proj']
+  lora_attn_modules: ['q_proj', 'v_proj', 'k_proj']  # removed output_proj to match AnswerAI for apples<=>apples comparison
   apply_lora_to_mlp: True
   apply_lora_to_output: False
   lora_rank: 64
@@ -45,6 +45,7 @@ resume_from_checkpoint: False
 dataset:
   _component_: torchtune.datasets.dummy_dataset
   max_seq_len: 2048
+  num_samples: 48
 seed: null
 shuffle: True
 batch_size: 8
@@ -62,16 +63,16 @@ loss:
   _component_: torch.nn.CrossEntropyLoss
 
 fsdp:
-  cpu_offload: False
+  cpu_offload: True
 
 # Training
 epochs: 1
-max_steps_per_epoch: 3
+max_steps_per_epoch: null
 gradient_accumulation_steps: 1
 compile: False
 
 # Logging
-output_dir: /tmp/qlora_finetune_output/
+output_dir: /tmp/qlora_finetune_output
 metric_logger:
   _component_: torchtune.utils.metric_logging.DiskLogger
   log_dir: ${output_dir}
@@ -83,9 +84,9 @@ device: cuda
 dtype: bf16
 enable_activation_checkpointing: True
 
-# Show case the usage of pytorch profiler
-# Set enabled to False as it's only needed for debugging training
-profiler:
-  _component_: torchtune.utils.profiler
-  enabled: True
-  output_dir: ${output_dir}/torchtune_perf_tracing.json
+# # Show case the usage of pytorch profiler
+# # Set enabled to False as it's only needed for debugging training
+# profiler:
+#   _component_: torchtune.utils.profiler
+#   enabled: True
+#   output_dir: ${output_dir}/torchtune_perf_tracing.json

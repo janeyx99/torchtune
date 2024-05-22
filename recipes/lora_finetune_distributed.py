@@ -25,6 +25,8 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     StateDictOptions,
 )
+from torch.profiler import profile, ProfilerActivity
+
 
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, DistributedSampler
@@ -42,6 +44,8 @@ from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
 
+# torch.set_float32_matmul_precision("high")
+# torch._dynamo.config.skip_fsdp_hooks = True
 
 class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -262,6 +266,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             last_epoch=self.global_step - 1,
         )
 
+        # self._profiler_enabled = cfg.profiler.enabled
+        # self._profiler = config.instantiate(cfg.profiler)
+        # print(f"{self._profiler}")
+        # print(f"{self._profiler_enabled=}")
+
     def _setup_model(
         self,
         cfg_model: DictConfig,
@@ -291,6 +300,12 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self.adapter_params = get_adapter_params(model)
         set_trainable_params(model, self.adapter_params)
 
+        def print_num_params(msg):
+            if self._is_rank_zero:
+                print(msg, "num trainable params:", len([p for p in model.parameters() if p.requires_grad]))
+        
+        print_num_params("After instantiation,")
+    
         if enable_activation_checkpointing:
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
@@ -315,6 +330,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     fully_shard(m, **fsdp_kwargs)
         fully_shard(model, **fsdp_kwargs)
 
+        print_num_params("After FSDP fully_shard,")
+
         if lora_weights_state_dict:
             utils.load_from_full_model_state_dict(
                 model, lora_weights_state_dict, self._device, self._is_rank_zero
@@ -333,6 +350,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             model, base_model_state_dict, self._device, self._is_rank_zero
         )
 
+        print_num_params("After LoRA,")
+
         # LoRA hyper-params needed for merging weights while saving checkpoints
         self._lora_rank = cfg_model.lora_rank
         self._lora_alpha = cfg_model.lora_alpha
@@ -350,6 +369,19 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         # synchronize before training begins
         torch.distributed.barrier()
 
+        if self._is_rank_zero:
+            print(model)
+        
+        # print("Applying compile")
+        # Try max autotune
+        # Will Feng's lazy scheduler? => will help overlap
+        # model.forward = torch.compile(model.forward)
+        print_num_params("Right before returning,")
+        for k, v in model.named_parameters():
+            if self._is_rank_zero and v.requires_grad:
+                print(k, type(v), v.shape, v.dtype)
+            elif self._is_rank_zero:
+                print("DOES NOT REQUIRE GRAD: ", k, type(v), v.shape, v.dtype)
         return model
 
     def _setup_optimizer(
@@ -516,79 +548,102 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
 
-        # self.epochs_run should be non-zero when we're resuming from a checkpoint
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
+        # Reset peak memory to track that
+        torch.cuda.reset_peak_memory_stats(rank)
 
-            # Update the sampler to ensure data is correctly shuffled across epochs
-            # in case shuffle is True
-            self._sampler.set_epoch(curr_epoch)
+        with profile(activities=[
+        ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
 
-            pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
-            for idx, batch in enumerate(self._dataloader):
-                if (
-                    self.max_steps_per_epoch is not None
-                    and (idx // self._gradient_accumulation_steps)
-                    == self.max_steps_per_epoch
-                ):
-                    break
+            # self.epochs_run should be non-zero when we're resuming from a checkpoint
+            for curr_epoch in range(self.epochs_run, self.total_epochs):
 
-                input_ids, labels = batch
-                input_ids = input_ids.to(self._device)
-                num_tokens += input_ids.numel()
-                labels = labels.to(self._device)
+                # Update the sampler to ensure data is correctly shuffled across epochs
+                # in case shuffle is True
+                self._sampler.set_epoch(curr_epoch)
 
-                logits = self._model(input_ids)
-                # Shift so that tokens < n predict n
-                logits = logits[..., :-1, :].contiguous()
-                labels = labels[..., 1:].contiguous()
-                logits = logits.transpose(1, 2)
-                # Compute loss
-                loss = self._loss_fn(logits, labels)
+                pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
+                for idx, batch in enumerate(self._dataloader):
+                    if self._is_rank_zero:
+                        print(f"{len(batch[0])=}, {[(t.shape, t.dtype) for t in batch[0]]}")
+                        print(f"{len(batch[1])=}, {[(t.shape, t.dtype) for t in batch[1]]}")
+                    # Start logging memory (first iter) if requested
+                    if idx==0 and rank == 0 and curr_epoch == 0:
+                        torch.cuda.memory._record_memory_history()
 
-                loss = loss / self._gradient_accumulation_steps
-                running_loss += loss
-                loss.backward()
-
-                # Step with optimizer
-                if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
-                    self._lr_scheduler.step()
-
-                    # Update the number of steps when the weights are updated
-                    self.global_step += 1
-
-                    loss_to_log = running_loss.item()
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Log per-step metrics
                     if (
-                        self.global_step % self._log_every_n_steps == 0
-                        and self._is_rank_zero
+                        self.max_steps_per_epoch is not None
+                        and (idx // self._gradient_accumulation_steps)
+                        == self.max_steps_per_epoch
                     ):
-                        time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_to_log,
-                            "lr": self._optimizer.param_groups[0]["lr"],
-                            "tokens_per_second": num_tokens / time_per_step,
-                        }
-                        if self._log_peak_memory_stats:
-                            log_dict.update(utils.get_memory_stats(device=self._device))
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
+                        break
+
+                    # if self._profiler_enabled and self._is_rank_zero:
+                    #     self._profiler.step()
+
+                    input_ids, labels = batch
+                    input_ids = input_ids.to(self._device)
+                    num_tokens += input_ids.numel()
+                    labels = labels.to(self._device)
+
+                    logits = self._model(input_ids)
+                    # Shift so that tokens < n predict n
+                    logits = logits[..., :-1, :].contiguous()
+                    labels = labels[..., 1:].contiguous()
+                    logits = logits.transpose(1, 2)
+                    # Compute loss
+                    loss = self._loss_fn(logits, labels)
+
+                    loss = loss / self._gradient_accumulation_steps
+                    running_loss += loss
+                    loss.backward()
+
+                    # Step with optimizer
+                    if (idx + 1) % self._gradient_accumulation_steps == 0:
+                        self._optimizer.step()
+                        self._optimizer.zero_grad(set_to_none=True)
+                        self._lr_scheduler.step()
+
+                        # Update the number of steps when the weights are updated
+                        self.global_step += 1
+
+                        loss_to_log = running_loss.item()
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
                         )
 
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
+                        # Log per-step metrics
+                        if (
+                            self.global_step % self._log_every_n_steps == 0
+                            and self._is_rank_zero
+                        ):
+                            time_per_step = time.perf_counter() - t0
+                            log_dict = {
+                                "loss": loss_to_log,
+                                "lr": self._optimizer.param_groups[0]["lr"],
+                                "tokens_per_second": num_tokens / time_per_step,
+                            }
+                            if self._log_peak_memory_stats:
+                                log_dict.update(utils.get_memory_stats(device=self._device))
+                            self._metric_logger.log_dict(
+                                log_dict,
+                                step=self.global_step,
+                            )
+
+                        # Reset running stats for the next step
+                        running_loss = 0
+                        num_tokens = 0
+                        t0 = time.perf_counter()
+
+                    # Stop logging memory (second iter)
+                    if idx==1 and rank == 0 and curr_epoch == 0:
+                        # torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+                        torch.cuda.memory._record_memory_history(enabled=None) # Stop recording
 
             self.epochs_run += 1
-            self.save_checkpoint(epoch=curr_epoch)
+        if self._is_rank_zero:
+            prof.export_chrome_trace(f"trace.json")
+        # self.save_checkpoint(epoch=curr_epoch[])
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
@@ -612,6 +667,7 @@ def recipe_main(cfg: DictConfig) -> None:
         )
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     init_process_group(backend="gloo" if cfg.device == "cpu" else "nccl")
+    torch.set_num_threads(8)
 
     config.log_config(recipe_name="LoRAFinetuneRecipeDistributed", cfg=cfg)
 
